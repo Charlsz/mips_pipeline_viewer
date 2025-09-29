@@ -62,7 +62,11 @@ interface SimulationState {
   currentStallCycles: number;
 
   forwardingEnabled: boolean;
-  stallsEnabled: boolean; // Add this new option
+  stallsEnabled: boolean; 
+
+  stallVictimIndex: number | null;
+  nextFetchIndex: number;
+  
 }
 
 // Define the shape of the context actions
@@ -72,7 +76,7 @@ interface SimulationActions {
   pauseSimulation: () => void;
   resumeSimulation: () => void;
   setForwardingEnabled: (enabled: boolean) => void;
-  setStallsEnabled: (enabled: boolean) => void; // Add this new action
+  setStallsEnabled: (enabled: boolean) => void;
 }
 
 // Create the contexts
@@ -99,7 +103,9 @@ const initialState: SimulationState = {
   stalls: {},
   currentStallCycles: 0,
   forwardingEnabled: true,
-  stallsEnabled: true, // Add this new option
+  stallsEnabled: true, 
+  stallVictimIndex: null, 
+  nextFetchIndex: 0,
 };
 
 const parseInstruction = (hexInstruction: string): RegisterUsage => {
@@ -287,66 +293,103 @@ const calculateNextState = (currentState: SimulationState): SimulationState => {
   }
 
   const nextCycle = currentState.currentCycle + 1;
-  const newInstructionStages: Record<number, number | null> = {};
-  let activeInstructions = 0;
 
-  let newStallCycles = currentState.currentStallCycles;
-  if (newStallCycles > 0) {
-    newStallCycles--;
+  // Completion check 
+  let totalStallCycles = 0;
+  Object.values(currentState.stalls).forEach((s) => (totalStallCycles += s || 0));
+  const completionCycle =
+    currentState.instructions.length > 0
+      ? currentState.instructions.length + currentState.stageCount - 1 + totalStallCycles
+      : 0;
+
+  // Helper: advance a stage by +1 
+  const adv = (s: number | null): number | null => {
+    if (s === null) return null;
+    const ns = s + 1;
+    return ns < currentState.stageCount ? ns : null;
+  };
+
+  const prev = currentState.instructionStages;
+  const newStages: Record<number, number | null> = {};
+  Object.keys(prev).forEach((k) => (newStages[Number(k)] = prev[Number(k)]));
+
+  let nextFetchIndex = currentState.nextFetchIndex;
+  let nextStallCycles = currentState.currentStallCycles;
+  let stallVictimIndex = currentState.stallVictimIndex;
+
+  if (currentState.currentStallCycles > 0) {
+    // Freeze IF (stage 0) and ID (stage 1); advance only EX/MEM/WB by +1
+    for (const [iStr, s] of Object.entries(prev)) {
+      const i = Number(iStr);
+      if (s === null) {
+        newStages[i] = null;        // still not fetched 
+      } else if (s >= 2) {
+        newStages[i] = adv(s);      // front keeps moving
+      } else {
+        newStages[i] = s;           // IF and ID frozen
+      }
+    }
+
+    // Keep victim index, decrease stall counter
+    nextStallCycles = currentState.currentStallCycles - 1;
+
+    const isFinished = nextCycle > completionCycle;
     return {
       ...currentState,
-      currentCycle: nextCycle,
-      instructionStages: currentState.instructionStages,
-      currentStallCycles: newStallCycles,
+      currentCycle: isFinished ? completionCycle : nextCycle,
+      instructionStages: newStages,
+      isRunning: !isFinished,
+      isFinished,
+      currentStallCycles: nextStallCycles,
+      stallVictimIndex,
+      nextFetchIndex,
     };
   }
 
-  let totalStallCycles = 0;
-  Object.values(currentState.stalls).forEach((stalls) => {
-    totalStallCycles += stalls;
-  });
+  // Move everything that is already in the pipe by +1
+  for (const [iStr, s] of Object.entries(prev)) {
+    const i = Number(iStr);
+    newStages[i] = adv(s);
+  }
 
-  currentState.instructions.forEach((_, index) => {
-    const precedingStalls = calculatePrecedingStalls(
-      currentState.stalls,
-      index
-    );
-    const stageIndex = nextCycle - index - 1 - precedingStalls;
+  // If IF is empty now, fetch exactly one new instruction into IF
+  const IFisEmpty =
+    !Object.values(newStages).some((s) => s === 0);
 
-    if (stageIndex >= 0 && stageIndex < currentState.stageCount) {
-      newInstructionStages[index] = stageIndex;
-      activeInstructions++;
+  if (IFisEmpty && nextFetchIndex < currentState.instructions.length) {
+    newStages[nextFetchIndex] = 0; // enters via IF/ID
+    nextFetchIndex += 1;
+  }
 
-      if (
-        stageIndex === 1 &&
-        currentState.stalls[index] > 0 &&
-        newStallCycles === 0
-      ) {
-        newStallCycles = currentState.stalls[index];
-      }
-    } else {
-      newInstructionStages[index] = null;
+  // If we just finished a stall last tick, promote ID -> EX 
+  if (currentState.stallVictimIndex !== null) {
+    const k = currentState.stallVictimIndex;
+    if (prev[k] === 1) {
+      newStages[k] = 2;
     }
-  });
+    stallVictimIndex = null; // clear after promotion
+  }
 
-  const completionCycle =
-    currentState.instructions.length > 0
-      ? currentState.instructions.length +
-        currentState.stageCount -
-        1 +
-        totalStallCycles
-      : 0;
+  // Check if any instruction is now in ID and requires stalls to schedule for next tick
+  for (const [iStr, s] of Object.entries(newStages)) {
+    const i = Number(iStr);
+    if (s === 1 && (currentState.stalls[i] || 0) > 0) {
+      nextStallCycles = currentState.stalls[i];
+      stallVictimIndex = i;
+      break; // only the closest hazard 
+    }
+  }
 
   const isFinished = nextCycle > completionCycle;
-  const isRunning = !isFinished;
-
   return {
     ...currentState,
     currentCycle: isFinished ? completionCycle : nextCycle,
-    instructionStages: newInstructionStages,
-    isRunning: isRunning,
-    isFinished: isFinished,
-    currentStallCycles: newStallCycles,
+    instructionStages: newStages,
+    isRunning: !isFinished,
+    isFinished,
+    currentStallCycles: nextStallCycles,
+    stallVictimIndex,
+    nextFetchIndex,
   };
 };
 
@@ -446,6 +489,8 @@ export function SimulationProvider({ children }: PropsWithChildren) {
         currentStallCycles: 0,
         forwardingEnabled: simulationState.forwardingEnabled,
         stallsEnabled: simulationState.stallsEnabled,
+        stallVictimIndex: null,
+        nextFetchIndex: 1
       });
     },
     [
